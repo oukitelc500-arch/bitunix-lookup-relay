@@ -14,28 +14,3 @@
     "node": ">=18.0.0"
   }
 }
-```
-
-4. Scroll down and click **"Commit changes"**
-
----
-
-## 📄 FILE 2: `server.js`
-
-1. Click **"Add file"** → **"Create new file"**
-2. Name: `server.js`
-3. Copy the **complete server.js code from the artifact above** (BitUnix Render Server - Final Code)
-4. Commit changes
-
----
-
-## ⚠️ Optional: Add `.gitignore`
-
-If you didn't select "Node" for .gitignore:
-
-1. Click **"Add file"** → **"Create new file"**
-2. Name: `.gitignore`
-3. Paste:
-```
-node_modules/
-.env
