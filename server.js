@@ -1,187 +1,169 @@
-// BitUnix Relay Server - Completely Separate from PIF
-// Handles BitUnix scraper uploads and PIF lookups
+// server.js - Fixed with health endpoint and better logging
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// CORS
+// Enable CORS for Chrome extension
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
   next();
 });
 
-// ⚠️ REPLACE THESE WITH YOUR URLs
-const BITUNIX_APPS_SCRIPT = process.env.BITUNIX_APPS_SCRIPT || "REPLACE_WITH_BITUNIX_APPS_SCRIPT_URL";
-const PIF_APPS_SCRIPT = process.env.PIF_APPS_SCRIPT || "https://script.google.com/macros/s/AKfycbyN4OWJhC7Hfg4pwkOMUsmjgJ309B0MgaJ69A776x7KxcmVAVZovcRxJQLb-oIOV7gGNQ/exec";
+// DEFAULT: your Apps Script /exec URL (you can change or set via env var on Render)
+const DEFAULT_GOOGLE_SCRIPT = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbwn6wyJbOELMCoMzBT8S-OCAgJbdS_J9qurkuOGLhY06WjVV7U_ch-qFfF_MdjuA7Dx2Q/exec";
 
-// In-memory storage for TradingView symbols
-let tradingViewSymbols = {
-  symbols: [],
-  fullData: [],
-  timestamp: null
-};
-
-// Health check
+// Health check endpoint (important for waking up free Render instances)
 app.get("/", (req, res) => {
-  res.json({
-    status: "OK",
-    message: "BitUnix Lookup Relay Server v1.0",
-    endpoints: {
-      uploadBitUnix: "POST /upload-bitunix",
-      fetchPIF: "GET /fetch-pif",
-      updateSymbols: "POST /update-symbols",
-      getSymbols: "GET /symbols/tradingview"
-    },
-    config: {
-      bitunixConfigured: BITUNIX_APPS_SCRIPT !== "REPLACE_WITH_BITUNIX_APPS_SCRIPT_URL",
-      pifConfigured: PIF_APPS_SCRIPT !== "REPLACE_WITH_PIF_APPS_SCRIPT_URL"
-    }
+  console.log("🏥 Health check received");
+  res.json({ 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    message: "Sheet relay alive. POST /upload with JSON { sheetName, values }"
   });
 });
 
-// ===== FETCH PIF DATA (from external PIF Apps Script) =====
-app.get("/fetch-pif", async (req, res) => {
-  console.log("📥 Fetching PIF data from external source...");
-  
-  try {
-    const response = await fetch(`${PIF_APPS_SCRIPT}?action=fetchPIF`);
-    const result = await response.json();
-    
-    if (result.success) {
-      console.log(`✅ Fetched ${result.data.length} PIF entries`);
-      res.json({
-        success: true,
-        data: result.data
-      });
-    } else {
-      console.error("❌ PIF fetch failed:", result);
-      res.status(500).json({
-        success: false,
-        error: "Failed to fetch PIF data"
-      });
-    }
-  } catch (error) {
-    console.error("❌ PIF fetch error:", error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
+app.get("/health", (req, res) => {
+  console.log("🏥 Health check received");
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ===== UPLOAD BITUNIX DATA =====
-app.post("/upload-bitunix", async (req, res) => {
-  console.log("📤 BitUnix upload request");
+// Main relay endpoint
+app.post("/upload", async (req, res) => {
+  const startTime = Date.now();
+  console.log("📤 Upload request received at", new Date().toISOString());
   
   try {
-    const { data } = req.body;
+    const body = req.body;
     
-    if (!data || !Array.isArray(data)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "Invalid data format" 
-      });
+    // Log request details
+    console.log("📊 Request details:");
+    console.log("  - Sheet name:", body.sheetName);
+    console.log("  - Rows count:", body.values?.length || 0);
+    console.log("  - Sample row:", body.values?.[0]);
+    
+    // Accept either { sheetName, values } or { sheetName, values, googleScriptUrl }
+    const scriptUrl = (body.googleScriptUrl && String(body.googleScriptUrl).trim()) || DEFAULT_GOOGLE_SCRIPT;
+    if (!scriptUrl) {
+      console.error("❌ No script URL configured");
+      return res.status(400).json({ ok: false, error: "No script URL configured." });
     }
-    
-    console.log(`Uploading ${data.length} BitUnix entries...`);
-    
-    const response = await fetch(BITUNIX_APPS_SCRIPT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "uploadBitUnix",
-        data: data
-      })
-    });
-    
-    const result = await response.json();
-    
-    console.log("Google Sheets response:", result);
-    
-    res.json({
-      success: true,
-      message: `${data.length} rows uploaded successfully`,
-      result: result
-    });
-    
-  } catch (error) {
-    console.error("❌ BitUnix upload error:", error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
 
-// ===== UPDATE SYMBOLS (for TradingView Extension 4) =====
-app.post("/update-symbols", (req, res) => {
-  console.log("📤 Received symbol update");
-  
-  try {
-    const { symbols, fullData, timestamp } = req.body;
-    
-    if (!symbols || !Array.isArray(symbols)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "Invalid symbols format" 
-      });
+    console.log("🎯 Target Apps Script:", scriptUrl.substring(0, 50) + "...");
+
+    // Basic validation: values should be an array
+    if (!body.values || !Array.isArray(body.values)) {
+      console.error("❌ Missing or invalid 'values' array");
+      return res.status(400).json({ ok: false, error: "Missing or invalid 'values' array in payload." });
     }
     
-    tradingViewSymbols = {
-      symbols: symbols,
-      fullData: fullData || [],
-      timestamp: timestamp || new Date().toISOString()
+    // Prepare the payload for the Apps Script
+    const forward = {
+      sheetName: body.sheetName || "Sheet1",
+      values: body.values
     };
+
+    console.log("⏳ Forwarding to Google Apps Script...");
+
+    // Forward once, then one retry on network/5xx
+    let tryCount = 0;
+    let lastErr = null;
+    while (tryCount < 2) {
+      tryCount++;
+      console.log(`🔄 Attempt ${tryCount}/2`);
+      
+      try {
+        const r = await fetch(scriptUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(forward),
+          timeout: 15000
+        });
+        
+        console.log(`📥 Apps Script responded with status: ${r.status}`);
+        
+        // Accept any 2xx (including 302, which GAS sometimes uses) as success
+        if (r.ok || r.status === 302) { 
+          const text = await r.text().catch(() => "");
+          const elapsed = Date.now() - startTime;
+          console.log(`✅ Upload successful! (${elapsed}ms)`);
+          console.log(`📝 Response:`, text.substring(0, 200));
+          
+          return res.json({ 
+            ok: true, 
+            forwarded: true, 
+            status: r.status, 
+            text,
+            elapsed: `${elapsed}ms`
+          });
+        } else {
+          lastErr = `Non-OK response ${r.status}`;
+          console.error(`⚠️ ${lastErr}`);
+          
+          // If 5xx, retry once
+          if (r.status >= 500 && tryCount < 2) {
+            console.log("⏳ Retrying in 500ms...");
+            await new Promise(r => setTimeout(r, 500));
+            continue;
+          } else {
+            // Failure response (e.g., 403 Forbidden means GAS permissions are wrong)
+            const text = await r.text().catch(() => "");
+            console.error(`❌ Forward failed: ${r.status}`);
+            console.error(`📝 Error response:`, text.substring(0, 200));
+            
+            return res.status(502).json({ 
+              ok: false, 
+              error: `Forward failed ${r.status}`, 
+              status: r.status, 
+              gasResponse: text 
+            });
+          }
+        }
+      } catch (fetchErr) {
+        lastErr = fetchErr.message;
+        console.error(`❌ Fetch error:`, fetchErr.message);
+        
+        if (tryCount < 2) {
+          console.log("⏳ Retrying in 500ms...");
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+      }
+    }
     
-    console.log(`✅ Stored ${symbols.length} symbols for TradingView`);
-    
-    res.json({
-      success: true,
-      message: `${symbols.length} symbols stored`,
-      count: symbols.length
+    // if we exit loop with failure:
+    const elapsed = Date.now() - startTime;
+    console.error(`❌ Upload failed after ${elapsed}ms and ${tryCount} attempts`);
+    return res.status(502).json({ 
+      ok: false, 
+      error: "Forward failed after retry", 
+      details: lastErr,
+      elapsed: `${elapsed}ms`
     });
+  } catch (err) {
+    const elapsed = Date.now() - startTime;
+    console.error(`❌ Relay error (${elapsed}ms):`, err.message);
+    console.error(err.stack);
     
-  } catch (error) {
-    console.error("❌ Symbol update error:", error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    return res.status(500).json({ 
+      ok: false, 
+      error: "Internal server error", 
+      details: err.message,
+      elapsed: `${elapsed}ms`
     });
   }
 });
 
-// ===== GET SYMBOLS (for TradingView Extension 4) =====
-app.get("/symbols/tradingview", (req, res) => {
-  console.log("📥 TradingView requesting symbols");
-  
-  if (tradingViewSymbols.symbols.length === 0) {
-    return res.json({
-      success: false,
-      message: "No symbols available. Run BitUnix scraper first.",
-      symbols: [],
-      count: 0
-    });
-  }
-  
-  res.json({
-    success: true,
-    symbols: tradingViewSymbols.symbols,
-    count: tradingViewSymbols.symbols.length,
-    timestamp: tradingViewSymbols.timestamp
-  });
-});
-
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`🚀 BitUnix Relay Server listening on port ${port}`);
-  console.log(`📡 BitUnix Apps Script: ${BITUNIX_APPS_SCRIPT}`);
-  console.log(`📡 PIF Apps Script: ${PIF_APPS_SCRIPT}`);
-  console.log(`⚠️  Make sure to set BITUNIX_APPS_SCRIPT environment variable!`);
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🚀 Sheet relay server listening on port ${PORT}`);
+  console.log(`📡 Apps Script URL: ${DEFAULT_GOOGLE_SCRIPT}`);
+  console.log(`🏥 Health endpoint: http://localhost:${PORT}/`);
+  console.log(`📤 Upload endpoint: http://localhost:${PORT}/upload`);
 });
