@@ -1,4 +1,4 @@
-// server.js - Fixed with health endpoint and better logging
+// server.js - Fixed with /fetch-pif endpoint restored
 import express from "express";
 import fetch from "node-fetch";
 
@@ -16,16 +16,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// DEFAULT: your Apps Script /exec URL (you can change or set via env var on Render)
-const DEFAULT_GOOGLE_SCRIPT = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbwn6wyJbOELMCoMzBT8S-OCAgJbdS_J9qurkuOGLhY06WjVV7U_ch-qFfF_MdjuA7Dx2Q/exec";
+// Apps Script URLs
+const GOOGLE_SHEET_SCRIPT = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbwn6wyJbOELMCoMzBT8S-OCAgJbdS_J9qurkuOGLhY06WjVV7U_ch-qFfF_MdjuA7Dx2Q/exec";
+const PIF_APPS_SCRIPT = process.env.PIF_APPS_SCRIPT || "https://script.google.com/macros/s/AKfycbyN4OWJhC7Hfg4pwkOMUsmjgJ309B0MgaJ69A776x7KxcmVAVZovcRxJQLb-oIOV7gGNQ/exec";
 
-// Health check endpoint (important for waking up free Render instances)
+// Health check endpoints
 app.get("/", (req, res) => {
   console.log("🏥 Health check received");
   res.json({ 
     status: "ok", 
     timestamp: new Date().toISOString(),
-    message: "Sheet relay alive. POST /upload with JSON { sheetName, values }"
+    message: "Sheet relay alive",
+    endpoints: {
+      health: "GET /health",
+      upload: "POST /upload",
+      fetchPIF: "GET /fetch-pif"
+    }
   });
 });
 
@@ -34,7 +40,44 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Main relay endpoint
+// ===== FETCH PIF DATA (RESTORED FROM OLD SERVER) =====
+app.get("/fetch-pif", async (req, res) => {
+  console.log("📥 Fetching PIF data from external source...");
+  
+  try {
+    const response = await fetch(`${PIF_APPS_SCRIPT}?action=fetchPIF`, {
+      timeout: 15000
+    });
+    
+    if (!response.ok) {
+      throw new Error(`PIF Apps Script returned ${response.status}`);
+    }
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      console.log(`✅ Fetched ${result.data.length} PIF entries`);
+      res.json({
+        success: true,
+        data: result.data
+      });
+    } else {
+      console.error("❌ PIF fetch failed:", result);
+      res.status(500).json({
+        success: false,
+        error: "Failed to fetch PIF data"
+      });
+    }
+  } catch (error) {
+    console.error("❌ PIF fetch error:", error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Upload endpoint (for sheet updates)
 app.post("/upload", async (req, res) => {
   const startTime = Date.now();
   console.log("📤 Upload request received at", new Date().toISOString());
@@ -42,14 +85,11 @@ app.post("/upload", async (req, res) => {
   try {
     const body = req.body;
     
-    // Log request details
     console.log("📊 Request details:");
     console.log("  - Sheet name:", body.sheetName);
     console.log("  - Rows count:", body.values?.length || 0);
-    console.log("  - Sample row:", body.values?.[0]);
     
-    // Accept either { sheetName, values } or { sheetName, values, googleScriptUrl }
-    const scriptUrl = (body.googleScriptUrl && String(body.googleScriptUrl).trim()) || DEFAULT_GOOGLE_SCRIPT;
+    const scriptUrl = (body.googleScriptUrl && String(body.googleScriptUrl).trim()) || GOOGLE_SHEET_SCRIPT;
     if (!scriptUrl) {
       console.error("❌ No script URL configured");
       return res.status(400).json({ ok: false, error: "No script URL configured." });
@@ -57,13 +97,11 @@ app.post("/upload", async (req, res) => {
 
     console.log("🎯 Target Apps Script:", scriptUrl.substring(0, 50) + "...");
 
-    // Basic validation: values should be an array
     if (!body.values || !Array.isArray(body.values)) {
       console.error("❌ Missing or invalid 'values' array");
       return res.status(400).json({ ok: false, error: "Missing or invalid 'values' array in payload." });
     }
     
-    // Prepare the payload for the Apps Script
     const forward = {
       sheetName: body.sheetName || "Sheet1",
       values: body.values
@@ -71,7 +109,6 @@ app.post("/upload", async (req, res) => {
 
     console.log("⏳ Forwarding to Google Apps Script...");
 
-    // Forward once, then one retry on network/5xx
     let tryCount = 0;
     let lastErr = null;
     while (tryCount < 2) {
@@ -88,12 +125,10 @@ app.post("/upload", async (req, res) => {
         
         console.log(`📥 Apps Script responded with status: ${r.status}`);
         
-        // Accept any 2xx (including 302, which GAS sometimes uses) as success
         if (r.ok || r.status === 302) { 
           const text = await r.text().catch(() => "");
           const elapsed = Date.now() - startTime;
           console.log(`✅ Upload successful! (${elapsed}ms)`);
-          console.log(`📝 Response:`, text.substring(0, 200));
           
           return res.json({ 
             ok: true, 
@@ -106,16 +141,13 @@ app.post("/upload", async (req, res) => {
           lastErr = `Non-OK response ${r.status}`;
           console.error(`⚠️ ${lastErr}`);
           
-          // If 5xx, retry once
           if (r.status >= 500 && tryCount < 2) {
             console.log("⏳ Retrying in 500ms...");
             await new Promise(r => setTimeout(r, 500));
             continue;
           } else {
-            // Failure response (e.g., 403 Forbidden means GAS permissions are wrong)
             const text = await r.text().catch(() => "");
             console.error(`❌ Forward failed: ${r.status}`);
-            console.error(`📝 Error response:`, text.substring(0, 200));
             
             return res.status(502).json({ 
               ok: false, 
@@ -137,7 +169,6 @@ app.post("/upload", async (req, res) => {
       }
     }
     
-    // if we exit loop with failure:
     const elapsed = Date.now() - startTime;
     console.error(`❌ Upload failed after ${elapsed}ms and ${tryCount} attempts`);
     return res.status(502).json({ 
@@ -149,7 +180,6 @@ app.post("/upload", async (req, res) => {
   } catch (err) {
     const elapsed = Date.now() - startTime;
     console.error(`❌ Relay error (${elapsed}ms):`, err.message);
-    console.error(err.stack);
     
     return res.status(500).json({ 
       ok: false, 
@@ -163,7 +193,9 @@ app.post("/upload", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Sheet relay server listening on port ${PORT}`);
-  console.log(`📡 Apps Script URL: ${DEFAULT_GOOGLE_SCRIPT}`);
-  console.log(`🏥 Health endpoint: http://localhost:${PORT}/`);
+  console.log(`📡 Sheet Apps Script: ${GOOGLE_SHEET_SCRIPT}`);
+  console.log(`📡 PIF Apps Script: ${PIF_APPS_SCRIPT}`);
+  console.log(`🏥 Health endpoint: http://localhost:${PORT}/health`);
   console.log(`📤 Upload endpoint: http://localhost:${PORT}/upload`);
+  console.log(`📥 Fetch PIF endpoint: http://localhost:${PORT}/fetch-pif`);
 });
